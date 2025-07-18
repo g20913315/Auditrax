@@ -18,6 +18,9 @@
 (define-constant ERR_DEADLINE_PASSED (err u106))
 (define-constant ERR_AUDIT_NOT_COMPLETE (err u107))
 (define-constant ERR_ALREADY_SUBMITTED (err u108))
+(define-constant ERR_REVISION_NOT_REQUESTED (err u109))
+(define-constant ERR_MAX_REVISIONS_REACHED (err u110))
+(define-constant ERR_INVALID_REVISION (err u111))
 
 (define-constant AUDIT_STATUS_OPEN u0)
 (define-constant AUDIT_STATUS_ASSIGNED u1)
@@ -26,8 +29,10 @@
 (define-constant AUDIT_STATUS_APPROVED u4)
 (define-constant AUDIT_STATUS_REJECTED u5)
 (define-constant AUDIT_STATUS_COMPLETED u6)
+(define-constant AUDIT_STATUS_REVISION_REQUESTED u7)
 
 (define-constant MIN_AUDIT_REWARD u1000000)
+(define-constant MAX_REVISIONS u3)
 (define-constant PLATFORM_FEE_PERCENT u5)
 
 ;; data vars
@@ -90,6 +95,37 @@
   {
     applied-at: uint,
     message: (string-ascii 200)
+  }
+)
+
+(define-map audit-revisions
+  { audit-id: uint, revision-number: uint }
+  {
+    auditor: principal,
+    report-hash: (string-ascii 64),
+    submitted-at: uint,
+    revision-notes: (string-ascii 300),
+    status: uint
+  }
+)
+
+(define-map revision-requests
+  uint
+  {
+    dao: principal,
+    requested-at: uint,
+    revision-notes: (string-ascii 500),
+    current-revision: uint,
+    max-revisions-allowed: uint
+  }
+)
+
+(define-map revision-history
+  uint
+  {
+    total-revisions: uint,
+    final-revision: uint,
+    revision-completed: bool
   }
 )
 
@@ -338,6 +374,225 @@
 
 (define-read-only (get-escrow-amount (audit-id uint))
   (map-get? audit-escrow audit-id)
+)
+
+(define-public (request-audit-revision (audit-id uint) (revision-notes (string-ascii 500)))
+  (let (
+    (audit-request (unwrap! (map-get? audit-requests audit-id) ERR_NOT_FOUND))
+    (submission (unwrap! (map-get? audit-submissions audit-id) ERR_NOT_FOUND))
+    (existing-revision-history (map-get? revision-history audit-id))
+  )
+    (asserts! (is-eq tx-sender (get dao audit-request)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status audit-request) AUDIT_STATUS_SUBMITTED) ERR_INVALID_STATUS)
+    
+    (let (
+      (current-revisions (match existing-revision-history
+        history (get total-revisions history)
+        u0))
+    )
+      (asserts! (< current-revisions MAX_REVISIONS) ERR_MAX_REVISIONS_REACHED)
+      
+      (map-set revision-requests audit-id {
+        dao: tx-sender,
+        requested-at: stacks-block-height,
+        revision-notes: revision-notes,
+        current-revision: current-revisions,
+        max-revisions-allowed: MAX_REVISIONS
+      })
+      
+      (map-set audit-requests audit-id 
+        (merge audit-request { status: AUDIT_STATUS_REVISION_REQUESTED })
+      )
+      
+      (match existing-revision-history
+        history (map-set revision-history audit-id
+          (merge history { revision-completed: false }))
+        (map-set revision-history audit-id {
+          total-revisions: u0,
+          final-revision: u0,
+          revision-completed: false
+        })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (submit-audit-revision 
+  (audit-id uint) 
+  (report-hash (string-ascii 64))
+  (revision-notes (string-ascii 300)))
+  (let (
+    (audit-request (unwrap! (map-get? audit-requests audit-id) ERR_NOT_FOUND))
+    (revision-request (unwrap! (map-get? revision-requests audit-id) ERR_REVISION_NOT_REQUESTED))
+    (revision-history-data (unwrap! (map-get? revision-history audit-id) ERR_NOT_FOUND))
+  )
+    (asserts! (is-eq (some tx-sender) (get auditor audit-request)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status audit-request) AUDIT_STATUS_REVISION_REQUESTED) ERR_INVALID_STATUS)
+    
+    (let (
+      (current-revision-number (+ (get total-revisions revision-history-data) u1))
+    )
+      (asserts! (<= current-revision-number MAX_REVISIONS) ERR_MAX_REVISIONS_REACHED)
+      
+      (map-set audit-revisions 
+        { audit-id: audit-id, revision-number: current-revision-number }
+        {
+          auditor: tx-sender,
+          report-hash: report-hash,
+          submitted-at: stacks-block-height,
+          revision-notes: revision-notes,
+          status: AUDIT_STATUS_SUBMITTED
+        }
+      )
+      
+      (map-set revision-history audit-id
+        (merge revision-history-data {
+          total-revisions: current-revision-number,
+          final-revision: current-revision-number
+        })
+      )
+      
+      (map-set audit-submissions audit-id {
+        auditor: tx-sender,
+        report-hash: report-hash,
+        submitted-at: stacks-block-height,
+        approved: false
+      })
+      
+      (map-set audit-requests audit-id 
+        (merge audit-request { status: AUDIT_STATUS_SUBMITTED })
+      )
+      
+      (ok current-revision-number)
+    )
+  )
+)
+
+(define-public (approve-audit-revision (audit-id uint) (revision-number uint))
+  (let (
+    (audit-request (unwrap! (map-get? audit-requests audit-id) ERR_NOT_FOUND))
+    (revision (unwrap! (map-get? audit-revisions { audit-id: audit-id, revision-number: revision-number }) ERR_INVALID_REVISION))
+    (revision-history-data (unwrap! (map-get? revision-history audit-id) ERR_NOT_FOUND))
+    (escrow-amount (unwrap! (map-get? audit-escrow audit-id) ERR_NOT_FOUND))
+    (reward (get reward audit-request))
+    (platform-fee (- escrow-amount reward))
+    (auditor (get auditor revision))
+  )
+    (asserts! (is-eq tx-sender (get dao audit-request)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status audit-request) AUDIT_STATUS_SUBMITTED) ERR_INVALID_STATUS)
+    (asserts! (is-eq revision-number (get final-revision revision-history-data)) ERR_INVALID_REVISION)
+    
+    (try! (as-contract (stx-transfer? reward tx-sender auditor)))
+    (var-set platform-fee-collected (+ (var-get platform-fee-collected) platform-fee))
+    
+    (map-set audit-revisions 
+      { audit-id: audit-id, revision-number: revision-number }
+      (merge revision { status: AUDIT_STATUS_APPROVED })
+    )
+    
+    (map-set revision-history audit-id
+      (merge revision-history-data { revision-completed: true })
+    )
+    
+    (map-set audit-submissions audit-id 
+      {
+        auditor: auditor,
+        report-hash: (get report-hash revision),
+        submitted-at: (get submitted-at revision),
+        approved: true
+      }
+    )
+    
+    (map-set audit-requests audit-id 
+      (merge audit-request { status: AUDIT_STATUS_COMPLETED })
+    )
+    
+    (map-delete audit-escrow audit-id)
+    (map-delete revision-requests audit-id)
+    
+    (match (map-get? auditor-profiles auditor)
+      auditor-profile (map-set auditor-profiles auditor
+        (merge auditor-profile {
+          total-audits: (+ (get total-audits auditor-profile) u1),
+          successful-audits: (+ (get successful-audits auditor-profile) u1),
+          reputation-score: (+ (get reputation-score auditor-profile) u15)
+        }))
+      false
+    )
+    
+    (match (map-get? dao-profiles tx-sender)
+      dao-profile (map-set dao-profiles tx-sender
+        (merge dao-profile { completed-audits: (+ (get completed-audits dao-profile) u1) }))
+      false
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (reject-audit-revision (audit-id uint) (revision-number uint))
+  (let (
+    (audit-request (unwrap! (map-get? audit-requests audit-id) ERR_NOT_FOUND))
+    (revision (unwrap! (map-get? audit-revisions { audit-id: audit-id, revision-number: revision-number }) ERR_INVALID_REVISION))
+    (revision-history-data (unwrap! (map-get? revision-history audit-id) ERR_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get dao audit-request)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status audit-request) AUDIT_STATUS_SUBMITTED) ERR_INVALID_STATUS)
+    (asserts! (is-eq revision-number (get final-revision revision-history-data)) ERR_INVALID_REVISION)
+    
+    (map-set audit-revisions 
+      { audit-id: audit-id, revision-number: revision-number }
+      (merge revision { status: AUDIT_STATUS_REJECTED })
+    )
+    
+    (map-set audit-requests audit-id 
+      (merge audit-request { status: AUDIT_STATUS_REJECTED })
+    )
+    
+    (map-delete revision-requests audit-id)
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-revision-request (audit-id uint))
+  (map-get? revision-requests audit-id)
+)
+
+(define-read-only (get-audit-revision (audit-id uint) (revision-number uint))
+  (map-get? audit-revisions { audit-id: audit-id, revision-number: revision-number })
+)
+
+(define-read-only (get-revision-history (audit-id uint))
+  (map-get? revision-history audit-id)
+)
+
+(define-read-only (get-all-revisions-for-audit (audit-id uint))
+  (let (
+    (history (map-get? revision-history audit-id))
+  )
+    (match history
+      revision-data (ok {
+        total-revisions: (get total-revisions revision-data),
+        final-revision: (get final-revision revision-data),
+        revision-completed: (get revision-completed revision-data)
+      })
+      (err ERR_NOT_FOUND)
+    )
+  )
+)
+
+(define-read-only (check-revision-limit (audit-id uint))
+  (let (
+    (history (map-get? revision-history audit-id))
+  )
+    (match history
+      revision-data (< (get total-revisions revision-data) MAX_REVISIONS)
+      true
+    )
+  )
 )
 
 ;; private functions
